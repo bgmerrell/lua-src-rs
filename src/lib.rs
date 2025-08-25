@@ -4,9 +4,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Represents the version of Lua to build.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum Version {
     Lua51,
+    Lua51Wasi,
     Lua52,
     Lua53,
     Lua54,
@@ -102,11 +103,31 @@ impl Build {
     /// Attempts to build the Lua artifacts for the specified version.
     ///
     /// Returns an error if the build fails.
+    ///
+    /// # WASI Build Requirements
+    ///
+    /// When building `Lua51Wasi` for the `wasm32-wasip1` target, the final WebAssembly
+    /// binary requires post-processing with `wasm-opt`. After linking your application,
+    /// run:
+    ///
+    /// ```bash
+    /// wasm-opt ./your-app.wasm -o ./your-app.exnref.wasm --translate-to-exnref -O2
+    /// ```
+    ///
+    /// Or use the [`wasm_opt_exnref`] helper function in your build script.
     pub fn try_build(&self, version: Version) -> Result<Artifacts, Box<dyn Error>> {
         let target = self.target.as_ref().ok_or("TARGET is not set")?;
         let out_dir = self.out_dir.as_ref().ok_or("OUT_DIR is not set")?;
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let mut source_dir = manifest_dir.join(version.source_dir());
+
+        // Auto-select Lua51Wasi when building for wasip1 target
+        let actual_version = if target.ends_with("wasip1") && version == Lua51 {
+            Lua51Wasi
+        } else {
+            version
+        };
+
+        let mut source_dir = manifest_dir.join(actual_version.source_dir());
         let lib_dir = out_dir.join("lib");
         let include_dir = out_dir.join("include");
 
@@ -138,13 +159,13 @@ impl Build {
                 config.define("LUA_USE_LINUX", None);
             }
             _ if target.contains("apple-darwin") => {
-                match version {
-                    Lua51 => config.define("LUA_USE_LINUX", None),
+                match actual_version {
+                    Lua51 | Lua51Wasi => config.define("LUA_USE_LINUX", None),
                     _ => config.define("LUA_USE_MACOSX", None),
                 };
             }
             _ if target.contains("apple-ios") => {
-                match version {
+                match actual_version {
                     Lua54 => config.define("LUA_USE_IOS", None),
                     _ => config.define("LUA_USE_POSIX", None),
                 };
@@ -152,6 +173,51 @@ impl Build {
             _ if target.contains("windows") => {
                 // Defined in Lua >= 5.3
                 config.define("LUA_USE_WINDOWS", None);
+            }
+            _ if target.ends_with("wasip1") => {
+                // Configure WASI SDK toolchain to match Makefile exactly
+                let wasi_sdk = env::var("WASI_SDK").unwrap_or_else(|_| "/opt/wasi-sdk".to_string());
+
+                let wasi_clang = format!("{}/bin/clang", wasi_sdk);
+                let wasi_ar = format!("{}/bin/llvm-ar", wasi_sdk);
+                let wasi_sysroot = format!("{}/share/wasi-sysroot", wasi_sdk);
+                let wasi_lib_dir = format!("{}/lib/wasm32-wasi", wasi_sysroot);
+
+                config
+                    .compiler(&wasi_clang)
+                    .archiver(&wasi_ar)
+                    // Match Makefile flags exactly
+                    .flag(&format!("--target=wasm32-wasi"))
+                    .flag(&format!("--sysroot={}", wasi_sysroot))
+                    .flag("-DLUA_COMPAT_5_2")
+                    .flag("-D_WASI_EMULATED_GETPID")
+                    .flag("-D_WASI_EMULATED_SIGNAL")
+                    .flag("-D_WASI_EMULATED_PROCESS_CLOCKS")
+                    .flag("-I/opt/include")
+                    .flag("-isystem")
+                    .flag("/opt/include")
+                    .flag("-mllvm")
+                    .flag("-wasm-enable-sjlj")
+                    .flag("-fwasm-exceptions")
+                    // Remove cc crate's default flags that conflict
+                    .flag("-Wall")
+                    .flag("-Wextra");
+
+                // Remove cc crate defaults that don't match Makefile
+                config.warnings(false);
+
+                // Compile WASI stubs
+                let wasi_stubs_c = source_dir.join("platform/wasi/wasi_stubs.c");
+                if wasi_stubs_c.exists() {
+                    config.file(&wasi_stubs_c);
+                }
+
+                // Add WASI emulation libraries
+                println!("cargo:rustc-link-search=native={}", wasi_lib_dir);
+                println!("cargo:rustc-link-lib=static=wasi-emulated-signal");
+                println!("cargo:rustc-link-lib=static=wasi-emulated-process-clocks");
+                println!("cargo:rustc-link-lib=static=wasi-emulated-getpid");
+                println!("cargo:rustc-link-lib=static=setjmp");
             }
             _ if target.ends_with("emscripten") => {
                 config
@@ -190,7 +256,7 @@ impl Build {
             _ => Err(format!("don't know how to build Lua for {target}"))?,
         }
 
-        if let Lua54 = version {
+        if let Lua54 = actual_version {
             config.define("LUA_COMPAT_5_3", None);
             #[cfg(feature = "ucid")]
             config.define("LUA_UCID", None);
@@ -214,13 +280,34 @@ impl Build {
             }
         }
 
-        config
-            .include(&source_dir)
-            .flag("-w") // Suppress all warnings
-            .flag_if_supported("-fno-common") // Compile common globals like normal definitions
-            .add_files_by_ext(&source_dir, "c")?
-            .out_dir(&lib_dir)
-            .try_compile(version.lib_name())?;
+        // For WASI builds, use minimal configuration to avoid conflicts
+        if target.ends_with("wasip1") {
+            config
+                .include(&source_dir)
+                .add_files_by_ext(&source_dir, "c")?
+                .out_dir(&lib_dir)
+                .try_compile(actual_version.lib_name())?;
+        } else {
+            config
+                .include(&source_dir)
+                .flag("-w") // Suppress all warnings
+                .flag_if_supported("-fno-common") // Compile common globals like normal definitions
+                .add_files_by_ext(&source_dir, "c")?
+                .out_dir(&lib_dir)
+                .try_compile(actual_version.lib_name())?;
+        }
+
+        // Print helpful message for WASI builds
+        if target.ends_with("wasip1") {
+            println!("cargo:warning=");
+            println!("cargo:warning=WASI Build Complete!");
+            println!("cargo:warning=");
+            println!("cargo:warning=IMPORTANT: After linking your final WebAssembly binary, you must run:");
+            println!("cargo:warning=  wasm-opt ./your-app.wasm -o ./your-app.exnref.wasm --translate-to-exnref -O2");
+            println!("cargo:warning=");
+            println!("cargo:warning=Or use the lua_src::wasm_opt_exnref() helper function in your build.rs");
+            println!("cargo:warning=");
+        }
 
         for f in &["lauxlib.h", "lua.h", "luaconf.h", "lualib.h"] {
             let from = source_dir.join(f);
@@ -232,8 +319,67 @@ impl Build {
         Ok(Artifacts {
             include_dir,
             lib_dir,
-            libs: vec![version.lib_name().to_string()],
+            libs: vec![actual_version.lib_name().to_string()],
         })
+    }
+
+    /// Runs wasm-opt post-processing on a WASI WebAssembly binary.
+    ///
+    /// This is required for lua-5.1.5-wasi builds to properly handle exceptions.
+    /// Call this function in your build.rs after linking your final WASM binary.
+    ///
+    /// # Arguments
+    /// * `input_wasm` - Path to the input WASM file
+    /// * `output_wasm` - Path to write the optimized WASM file
+    ///
+    /// # Example
+    /// ```no_run
+    /// // In your build.rs:
+    /// lua_src::wasm_opt_exnref("target/wasm32-wasip1/release/myapp.wasm",
+    ///                          "target/wasm32-wasip1/release/myapp.exnref.wasm")?;
+    /// ```
+    pub fn wasm_opt_exnref<P: AsRef<Path>>(
+        input_wasm: P,
+        output_wasm: P,
+    ) -> Result<(), Box<dyn Error>> {
+        let input = input_wasm.as_ref();
+        let output = output_wasm.as_ref();
+
+        // Find wasm-opt in WASI SDK or system PATH
+        let wasi_sdk = env::var("WASI_SDK").unwrap_or_else(|_| "/opt/wasi-sdk".to_string());
+        let wasm_opt = format!("{}/bin/wasm-opt", wasi_sdk);
+
+        // Check if wasm-opt exists in WASI SDK, otherwise try system PATH
+        let wasm_opt_cmd = if Path::new(&wasm_opt).exists() {
+            wasm_opt
+        } else {
+            "wasm-opt".to_string()
+        };
+
+        println!(
+            "Running wasm-opt --translate-to-exnref on {}",
+            input.display()
+        );
+
+        let output_result = std::process::Command::new(&wasm_opt_cmd)
+            .arg(input)
+            .arg("-o")
+            .arg(output)
+            .arg("--translate-to-exnref")
+            .arg("-O2")
+            .output()
+            .map_err(|e| format!("Failed to run wasm-opt: {}. Make sure wasm-opt is installed and in your PATH or WASI_SDK/bin directory.", e))?;
+
+        if !output_result.status.success() {
+            return Err(format!(
+                "wasm-opt failed with status {}: {}",
+                output_result.status,
+                String::from_utf8_lossy(&output_result.stderr)
+            )
+            .into());
+        }
+
+        Ok(())
     }
 }
 
@@ -241,6 +387,7 @@ impl Version {
     fn source_dir(&self) -> &str {
         match self {
             Lua51 => "lua-5.1.5",
+            Lua51Wasi => "lua-5.1.5-wasi",
             Lua52 => "lua-5.2.4",
             Lua53 => "lua-5.3.6",
             Lua54 => "lua-5.4.8",
@@ -250,6 +397,7 @@ impl Version {
     fn lib_name(&self) -> &str {
         match self {
             Lua51 => "lua5.1",
+            Lua51Wasi => "lua5.1-wasi",
             Lua52 => "lua5.2",
             Lua53 => "lua5.3",
             Lua54 => "lua5.4",

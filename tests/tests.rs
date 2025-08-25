@@ -9,6 +9,7 @@ fn test_build() {
 
     for version in [
         lua_src::Lua51,
+        lua_src::Lua51Wasi,
         lua_src::Lua52,
         lua_src::Lua53,
         lua_src::Lua54,
